@@ -2050,7 +2050,7 @@ pub fn accounts_command(prog: &str) -> String {
         "---\n\
 description: Claude accounts: usage on each, switch (switch <name> | next | auto on/off/<pct> | add [name] | rename | remove)\n\
 argument-hint: \"[list | switch <name> | next | auto on|off|<pct> | add [name] | rename <old> <new> | remove <name>]\"\n\
-allowed-tools: Bash(claude-accounts:*)\n\
+allowed-tools: Bash({prog}:*)\n\
 ---\n\
 Output of `claude-accounts $ARGUMENTS`:\n\
 \n\
@@ -2853,6 +2853,7 @@ mod tests {
         assert_eq!(program_for_claude(Path::new("/tmp/it's/claude-accounts"), None), None);
         let cmd = accounts_command("claude-accounts");
         assert!(cmd.starts_with("---\ndescription: Claude accounts") && cmd.contains("\n!`claude-accounts $ARGUMENTS 2>&1`\n"), "{cmd}");
+        assert!(accounts_command("/opt/x/claude-accounts").contains("allowed-tools: Bash(/opt/x/claude-accounts:*)\n"), "what it runs is what it may run");
     }
 
     /// The live sign-in's file as Claude writes it, and `.claude.json` naming whose it is.
