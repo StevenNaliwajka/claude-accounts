@@ -1,0 +1,19 @@
+[package]
+name = "claude-accounts"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Several Claude subscriptions in Claude Code: switches by itself near a limit, a status line with each account's usage, and session titles"
+license = "MIT"
+readme = "README.md"
+keywords = ["claude", "claude-code", "statusline", "cli"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+serde_json = "1"
+sha2 = "0.10"
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+
+[profile.release]
+strip = true
+lto = "thin"
