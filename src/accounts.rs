@@ -164,11 +164,40 @@ fn write_json(p: &Path, v: &Value, private: bool) -> Result<(), String> {
         #[cfg(not(unix))]
         let _ = private;
         let mut f = o.open(&tmp).map_err(|e| format!("{}: {e}", p.display()))?;
-        f.write_all(text.as_bytes()).map_err(|e| format!("{}: {e}", p.display()))?;
         // On disk before it's renamed in: a power cut never leaves it empty.
-        f.sync_all().map_err(|e| format!("{}: {e}", p.display()))?;
+        if let Err(e) = f.write_all(text.as_bytes()).and_then(|_| f.sync_all()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("{}: {e}", p.display()));
+        }
     }
-    std::fs::rename(&tmp, p).map_err(|e| format!("{}: {e}", p.display()))
+    std::fs::rename(&tmp, p).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", p.display())
+    })
+}
+
+/// A half-written `write_json` left behind (`<name>.tmp.<pid>`, older than
+/// `TMP_STALE`): its process was killed between writing and renaming (Claude
+/// ends a status line that runs long; on 2026-11-26, while memory ran out, 197
+/// were left in the cache). Swept by the background refresh.
+const TMP_STALE: f64 = 600.;
+
+/// Remove the stale half-written files in `dir`; how many.
+fn sweep_tmp(dir: &Path, t: f64) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    let mut gone = 0;
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some((_, pid)) = name.rsplit_once(".tmp.") else { continue };
+        if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|m| m.duration_since(UNIX_EPOCH).ok()).is_some_and(|m| t - m.as_secs_f64() > TMP_STALE);
+        if old && std::fs::remove_file(e.path()).is_ok() {
+            gone += 1;
+        }
+    }
+    gone
 }
 
 // ------------------------------------------------------------------ Claude's own sign-in
@@ -868,6 +897,7 @@ fn refresh_all(pl: &Places, force: bool) -> Map<String, Value> {
     if lock.try_lock().is_err() {
         return load_cache(pl);
     }
+    sweep_tmp(&pl.cache, now());
     let active = sync_live(pl, None, false);
     let cache = load_cache(pl);
     let accs = accounts(pl);
@@ -1043,32 +1073,168 @@ pub fn pick_next(names: &[String], active: Option<&str>, cache: &Map<String, Val
     names.iter().filter(|n| Some(n.as_str()) != active && room(cache.get(*n), t, at) > 2.).min_by(use_order(cache, t, at)).cloned()
 }
 
-/// Seconds until the weekly limit at the recent pace; None: not before it resets.
-pub fn projection(ent: &Value, t: f64) -> Option<f64> {
+/// The burn is every account's rise over this long (their pace histories).
+const BURN_SPAN: f64 = 86400.;
+/// A burn from less history than this isn't one.
+const BURN_MIN: f64 = 2. * 3600.;
+
+/// Points of its week an account has used per second lately: the rise over
+/// the last 3 hours of its history (at least 10 minutes of it), else its
+/// week's average so far. None: neither to go by.
+pub fn pace(ent: &Value, t: f64) -> Option<f64> {
     let (pct, reset) = window(ent.get("usage"), "wk")?;
-    let reset = reset?;
-    if pct >= 100. {
-        return Some(0.);
-    }
     let hist: Vec<(f64, f64)> = ent.get("history").and_then(Value::as_array).into_iter().flatten().filter_map(|x| Some((x.get(0)?.as_f64()?, x.get(1)?.as_f64()?))).collect();
     let recent: Vec<&(f64, f64)> = hist.iter().filter(|x| t - x.0 < 3. * 3600.).collect();
-    let mut rate = None;
     if recent.len() >= 2 {
         let (a, b) = (recent[0], recent[recent.len() - 1]);
         if b.0 - a.0 > 600. && b.1 > a.1 {
-            rate = Some((b.1 - a.1) / (b.0 - a.0));
+            return Some((b.1 - a.1) / (b.0 - a.0));
         }
     }
-    if rate.is_none() {
-        let elapsed = t - (reset - 7. * 86400.);
-        if elapsed > 3600. && pct > 0. {
-            rate = Some(pct / elapsed);
-        }
-    }
-    let rate = rate.filter(|r| *r > 0.)?;
-    let eta = (100. - pct) / rate;
-    (t + eta < reset).then_some(eta)
+    let elapsed = t - (reset? - 7. * 86400.);
+    (elapsed > 3600. && pct > 0.).then(|| pct / elapsed)
 }
+
+/// Where an account's week is going at its pace (`pace`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Outlook {
+    /// It reaches its mark this many seconds from now (0: it's there).
+    Hits(f64),
+    /// It lasts until its week resets, by when about this much is used.
+    Lasts(f64),
+}
+
+/// The active account's outlook against `mark` (`mark_of`: a rule's own, not
+/// only 100%). None: no numbers, no reset known, or no pace to go by.
+pub fn projection(ent: &Value, t: f64, mark: f64) -> Option<Outlook> {
+    let (pct, reset) = window(ent.get("usage"), "wk")?;
+    if pct >= mark {
+        return Some(Outlook::Hits(0.));
+    }
+    let reset = reset.filter(|r| *r > t)?;
+    let rate = pace(ent, t)?;
+    if rate <= 0. {
+        return Some(Outlook::Lasts(pct));
+    }
+    let eta = (mark - pct) / rate;
+    Some(if t + eta < reset { Outlook::Hits(eta) } else { Outlook::Lasts(pct + rate * (reset - t)) })
+}
+
+/// The burn (`burn`) from each account's own pace history in the usage cache
+/// (its last day of its week): points of a week used per hour, every account
+/// together, and over how many hours. None: under `BURN_MIN` of history.
+pub fn burn_from_cache(cache: &Map<String, Value>, t: f64) -> Option<(f64, f64)> {
+    let (mut used, mut first) = (0., f64::INFINITY);
+    for e in cache.values() {
+        let hist: Vec<(f64, f64, f64)> = e
+            .get("history")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|x| Some((x.get(0)?.as_f64()?, x.get(1)?.as_f64()?, x.get(2).and_then(Value::as_f64).unwrap_or(0.))))
+            .filter(|x| x.0 >= t - BURN_SPAN && x.0 <= t + 60.)
+            .collect();
+        if let Some(f) = hist.first() {
+            first = first.min(f.0);
+        }
+        for w in hist.windows(2) {
+            used += if (w[0].2 - w[1].2).abs() < 600. { (w[1].1 - w[0].1).max(0.) } else { w[1].1 };
+        }
+    }
+    let hours = (t - first) / 3600.;
+    (hours * 3600. >= BURN_MIN && hours.is_finite()).then(|| (used / hours, hours))
+}
+
+/// How far ahead `pool_outlook` looks.
+const OUTLOOK_SPAN: f64 = 7. * 86400.;
+
+/// When every account runs out at the burn (`burn_from_cache`), resets played forward.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PoolOutlook {
+    /// Every account out at `at`, the first with room again and when (None: not known).
+    Out { at: f64, back: Option<(String, f64)> },
+    /// Something has room all through `OUTLOOK_SPAN`.
+    Lasts,
+    /// No burn to go by (under `BURN_MIN` of history).
+    Unknown,
+}
+
+/// The points every account has left under the mark `at` (one that can't be
+/// used, none).
+pub fn room_left(names: &[String], cache: &Map<String, Value>, t: f64, at: f64) -> f64 {
+    names.iter().map(|n| room(cache.get(n), t, at).max(0.)).sum()
+}
+
+/// The accounts used at the burn (points of a week an hour, every account
+/// alike) from `t` as the tool would use them: `active` while it has room
+/// (unless that leaves part of a week ending sooner unused), else the week
+/// that ends soonest first (`use_order`); each up to the mark `at`; a reset
+/// empties one (its next week starts when it's used); a sign-in gone or a
+/// refusal is never used.
+pub fn pool_outlook(names: &[String], cache: &Map<String, Value>, active: Option<&str>, burn: Option<(f64, f64)>, t: f64, at: f64) -> PoolOutlook {
+    struct Acc {
+        name: String,
+        pct: f64,
+        end: f64,
+        ok: bool,
+    }
+    let Some(rate) = burn.map(|b| b.0 / 3600.) else { return PoolOutlook::Unknown };
+    if rate <= 0. {
+        return PoolOutlook::Lasts;
+    }
+    let mut accs: Vec<Acc> = names
+        .iter()
+        .map(|n| {
+            let ent = cache.get(n);
+            let pct = match window(ent.and_then(|e| e.get("usage")), "wk") {
+                Some((p, Some(r))) if r > t => p,
+                Some((p, None)) => p,
+                _ => 0.,
+            };
+            Acc { name: n.clone(), pct, end: week_ends(ent, t), ok: headroom(ent, t) >= 0. }
+        })
+        .collect();
+    let eps = 1e-6;
+    let (mut now, until) = (t, t + OUTLOOK_SPAN);
+    let mut on = active.and_then(|a| accs.iter().position(|x| x.name == a));
+    for _ in 0..500 {
+        for a in accs.iter_mut().filter(|a| a.end <= now + eps) {
+            a.pct = 0.;
+            a.end = f64::INFINITY;
+        }
+        let left = |i: usize| if accs[i].ok { at - accs[i].pct } else { 0. };
+        let usable: Vec<usize> = (0..accs.len()).filter(|i| left(*i) > eps).collect();
+        if usable.is_empty() {
+            let back = accs.iter().filter(|a| a.ok && a.end.is_finite()).map(|a| (a.name.clone(), a.end)).min_by(|x, y| x.1.total_cmp(&y.1));
+            return PoolOutlook::Out { at: now, back };
+        }
+        let first = *usable.iter().min_by(|x, y| accs[**x].end.total_cmp(&accs[**y].end).then(left(**y).total_cmp(&left(**x))).then(accs[**x].name.cmp(&accs[**y].name))).unwrap_or(&usable[0]);
+        let i = match on.filter(|i| usable.contains(i)) {
+            Some(cur) if accs[first].end < accs[cur].end - SAME_END && left(cur) + left(first) > rate * (accs[first].end - now) => first,
+            Some(cur) => cur,
+            None => first,
+        };
+        let room_i = left(i);
+        on = Some(i);
+        if !accs[i].end.is_finite() {
+            // A week not started starts now.
+            accs[i].end = now + 7. * 86400.;
+        }
+        let mut next = (now + room_i / rate).min(until);
+        for a in &accs {
+            if a.end.is_finite() && a.end > now + eps {
+                next = next.min(a.end);
+            }
+        }
+        accs[i].pct = (accs[i].pct + rate * (next - now)).min(100.);
+        now = next;
+        if now >= until - eps {
+            return PoolOutlook::Lasts;
+        }
+    }
+    PoolOutlook::Lasts
+}
+
 
 /// (Auto-switch on, the mark it never lets the active account pass). On
 /// unless `auto off`; 100% unless `auto <pct>`.
@@ -1361,6 +1527,38 @@ pub fn pct_text(p: f64) -> String {
     if p > 99. && p < 100. { format!("{p:.1}") } else { format!("{p:.0}") }
 }
 
+/// A moment `at` as a clock in this PC's time zone (`off`: seconds east of
+/// UTC), as near as it is to `t`: "21:05" the same day, "Fri 21:05" within
+/// the week, "Dec 3" after.
+pub fn clock(at: f64, t: f64, off: i64) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let (a, n) = (at as i64 + off, t as i64 + off);
+    let (day, today) = (a.div_euclid(86400), n.div_euclid(86400));
+    let sod = a.rem_euclid(86400);
+    let hm = format!("{:02}:{:02}", sod / 3600, sod % 3600 / 60);
+    if day == today {
+        hm
+    } else if day > today && day - today < 7 {
+        format!("{} {hm}", DAYS[day.rem_euclid(7) as usize])
+    } else {
+        let (_, mo, d) = crate::util::civil_from_days(day);
+        format!("{} {d}", MONTHS[(mo as usize).clamp(1, 12) - 1])
+    }
+}
+
+/// A token count, short: "850", "57k", "1M", "1.5M".
+pub fn tokens_text(n: f64) -> String {
+    if n >= 1e6 {
+        let m = n / 1e6;
+        if (m - m.round()).abs() < 0.05 { format!("{:.0}M", m) } else { format!("{m:.1}M") }
+    } else if n >= 1e3 {
+        format!("{:.0}k", n / 1e3)
+    } else {
+        format!("{n:.0}")
+    }
+}
+
 /// "3d 4h", "2h 5m", "7m"; `upper`: one unit, "3D".
 pub fn dur(sec: Option<f64>, upper: bool) -> String {
     let Some(sec) = sec else { return "?".into() };
@@ -1482,23 +1680,33 @@ pub fn others_order<'a>(names: &'a [String], active: &str, cache: &Map<String, V
     v
 }
 
-/// Claude Code's status line: the accounts (the active one's use and pace,
-/// the next one's name, the others' in `others_order`), then the session
-/// (model and effort, context, folder and branch, lines and cost). `d` is
-/// what Claude sends; `at` the auto-switch mark (what counts as full).
+/// Claude Code's status line, three lines:
+/// - the accounts: the active one's week against the mark `at`,
+///   when it resets and where its pace takes it (`projection`: the limit's
+///   ETA, or about how much is used by the reset); the next one; the others,
+///   in the order Claude would go to them (`others_order`);
+/// - ETA: when every account runs out at the burn (`pool_outlook`) and when
+///   one has room again; what's left and the burn;
+/// - the session: model, effort and fast mode; context and the prompt cache;
+///   folder and branch; lines, time and cost.
+///
+/// `d` is what Claude sends; `at` the auto-switch mark (what counts as
+/// full); `burn` the last day's (`burn_from_cache`); `off` this PC's time zone.
 #[allow(clippy::too_many_arguments)]
-pub fn statusline(d: &Value, cache: &Map<String, Value>, active: Option<&str>, names: &[String], home: &Path, t: f64, at: f64, color: bool) -> String {
+pub fn statusline(d: &Value, cache: &Map<String, Value>, active: Option<&str>, names: &[String], home: &Path, t: f64, at: f64, color: bool, burn: Option<(f64, f64)>, off: i64) -> String {
     let p = Paint(color);
     let sep = format!(" {}|{} ", p.dim(), p.r());
-    let mut l1 = Vec::new();
+    let mut lines = Vec::new();
     match active {
         Some(active) => {
+            let mut l1 = Vec::new();
             let empty = json!({});
             let ent = &active_view(d, cache, active, t);
             let u = ent.get("usage").unwrap_or(&empty);
+            let mark = at;
             let mut part = format!("{}{}◆ {active}{}", p.grn(), p.b(), p.r());
             if let Some((pct, reset)) = window(Some(u), "wk") {
-                part += &format!(" wk {}", p.pc(pct));
+                part += &format!(" wk {}{}/{mark:.0}{}", p.pc(pct), p.dim(), p.r());
                 if let Some(r) = reset {
                     part += &format!(" {}⧗{}{}", p.dim(), dur(Some(r - t), false), p.r());
                 }
@@ -1513,8 +1721,15 @@ pub fn statusline(d: &Value, cache: &Map<String, Value>, active: Option<&str>, n
                     part += &format!(" {} {}", sc.get("model").and_then(Value::as_str).unwrap_or("model"), p.pc(pct));
                 }
             }
-            if let Some(eta) = projection(ent, t) {
-                part += &format!(" {}▲ limit in {}{}", p.org(), dur(Some(eta), false), p.r());
+            // Where its pace takes it: the limit's ETA, or about how much is used by its reset.
+            match projection(ent, t, mark) {
+                Some(Outlook::Hits(s)) if s <= 0. => part += &format!(" {}▲ at its limit{}", p.red(), p.r()),
+                Some(Outlook::Hits(s)) => {
+                    let col = if s < 3600. { p.red() } else { p.org() };
+                    part += &format!(" {col}▲ limit in {} ({}){}", dur(Some(s), false), clock(t + s, t, off), p.r());
+                }
+                Some(Outlook::Lasts(e)) => part += &format!(" {}✓{} {}~{}% by reset{}", p.grn(), p.r(), p.dim(), pct_text(e.round()), p.r()),
+                None => {}
             }
             match problem(ent) {
                 Problem::Error(e) => part += &format!(" {}!{e}{}", p.red(), p.r()),
@@ -1544,8 +1759,10 @@ pub fn statusline(d: &Value, cache: &Map<String, Value>, active: Option<&str>, n
             if !others.is_empty() {
                 l1.push(others.join(&format!(" {}·{} ", p.dim(), p.r())));
             }
+            lines.push(l1.join(&sep));
+            lines.push(eta_line(names, cache, active, burn, t, at, off, &p));
         }
-        None => l1.push(format!("{}no Claude account signed in{}", p.dim(), p.r())),
+        None => lines.push(format!("{}no Claude account signed in{}", p.dim(), p.r())),
     }
     let m = d.get("model").cloned().unwrap_or_else(|| json!({}));
     let model = m.get("display_name").or_else(|| m.get("id")).and_then(Value::as_str).unwrap_or("?");
@@ -1555,12 +1772,40 @@ pub fn statusline(d: &Value, cache: &Map<String, Value>, active: Option<&str>, n
         Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
         _ => None,
     };
-    let mut l2 = vec![match eff {
+    let mut first = match eff {
         Some(e) => format!("{model} {e}"),
         None => model.to_string(),
-    }];
-    if let Some(ctx) = d.pointer("/context_window/used_percentage").and_then(Value::as_f64) {
-        l2.push(format!("ctx {}", p.pc(ctx)));
+    };
+    if d.get("fast_mode").and_then(Value::as_bool) == Some(true) {
+        first += &format!(" {}⚡fast{}", p.yel(), p.r());
+    }
+    let mut l3 = vec![first];
+    let cw = d.get("context_window");
+    let mut ctx = Vec::new();
+    if let Some(pc) = cw.and_then(|c| c.get("used_percentage")).and_then(Value::as_f64) {
+        let mut c = format!("ctx {}", p.pc(pc));
+        let size = cw.and_then(|c| c.get("context_window_size")).and_then(Value::as_f64).filter(|s| *s > 0.);
+        // What the next request sends: the last one's whole input.
+        let used = cw.and_then(|c| c.get("current_usage")).and_then(Value::as_object).map(|u| ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"].iter().filter_map(|k| u.get(*k).and_then(Value::as_f64)).sum::<f64>()).filter(|n| *n > 0.);
+        if let (Some(used), Some(size)) = (used.or_else(|| size.map(|s| s * pc / 100.)).filter(|n| *n >= 1.), size) {
+            c += &format!(" {}{}/{}{}", p.dim(), tokens_text(used), tokens_text(size), p.r());
+        }
+        ctx.push(c);
+    }
+    // The prompt cache: how long until it's gone (the next request then writes the whole context again).
+    if let Some(pc) = d.get("prompt_cache").filter(|c| c.is_object()) {
+        let left = pc.get("expires_at").and_then(Value::as_f64).map(|e| e - t);
+        match left {
+            Some(l) if l > 0. && pc.get("warm").and_then(Value::as_bool) != Some(false) => {
+                let col = if l < 300. { p.yel() } else { p.grn() };
+                ctx.push(format!("cache {col}{}{}", dur(Some(l), false), p.r()));
+            }
+            Some(_) => ctx.push(format!("{}cache cold{}", p.dim(), p.r())),
+            None => {}
+        }
+    }
+    if !ctx.is_empty() {
+        l3.push(ctx.join(&format!(" {}·{} ", p.dim(), p.r())));
     }
     let cwd = d.pointer("/workspace/current_dir").or_else(|| d.get("cwd")).and_then(Value::as_str).map(PathBuf::from).or_else(|| std::env::current_dir().ok()).unwrap_or_default();
     let shown = {
@@ -1575,7 +1820,7 @@ pub fn statusline(d: &Value, cache: &Map<String, Value>, active: Option<&str>, n
     if let Some(br) = git_branch(&cwd) {
         loc += &format!(" {}⎇ {br}{}", p.mag(), p.r());
     }
-    l2.push(loc);
+    l3.push(loc);
     let co = d.get("cost").cloned().unwrap_or_else(|| json!({}));
     let mut tail = Vec::new();
     let (add, rem) = (co.get("total_lines_added").and_then(Value::as_i64).unwrap_or(0), co.get("total_lines_removed").and_then(Value::as_i64).unwrap_or(0));
@@ -1589,16 +1834,58 @@ pub fn statusline(d: &Value, cache: &Map<String, Value>, active: Option<&str>, n
         tail.push(format!("${usd:.2}"));
     }
     if !tail.is_empty() {
-        l2.push(tail.join(" "));
+        l3.push(tail.join(" "));
     }
-    format!("{}\n{}", l1.join(&sep), l2.join(&sep))
+    lines.push(l3.join(&sep));
+    lines.join("\n")
+}
+
+/// The status line's ETA line: when every account runs out at the burn
+/// (`pool_outlook`, red within 6 hours) and the first with room again; else
+/// that they last the week; then the points left and the burn.
+#[allow(clippy::too_many_arguments)]
+fn eta_line(names: &[String], cache: &Map<String, Value>, active: &str, burn: Option<(f64, f64)>, t: f64, at: f64, off: i64, p: &Paint) -> String {
+    let mut s = format!("{}ETA{} ", p.b(), p.r());
+    match pool_outlook(names, cache, Some(active), burn, t, at) {
+        PoolOutlook::Out { at: out, back } => {
+            let col = if out - t < 6. * 3600. { p.red() } else { p.org() };
+            if out - t < 60. {
+                s += &format!("{col}▼ all out now{}", p.r());
+            } else {
+                s += &format!("{col}▼ all out {} (in {}){}", clock(out, t, off), dur(Some(out - t), false), p.r());
+            }
+            s += &match back {
+                Some((n, b)) => format!(" {}→ back {} ({n}){}", p.dim(), clock(b, t, off), p.r()),
+                None => format!(" {}→ back ?{}", p.dim(), p.r()),
+            };
+        }
+        PoolOutlook::Lasts => s += &format!("{}✓{} {}tokens last the week{}", p.grn(), p.r(), p.dim(), p.r()),
+        PoolOutlook::Unknown => s += &format!("{}? the burn needs {:.0}h of usage history{}", p.dim(), BURN_MIN / 3600., p.r()),
+    }
+    let room = room_left(names, cache, t, at);
+    s += &match burn {
+        Some((per_h, _)) => format!(" {}· {room:.0} pts left at {per_h:.1}/h{}", p.dim(), p.r()),
+        None => format!(" {}· {room:.0} pts left{}", p.dim(), p.r()),
+    };
+    s
+}
+
+/// Whether a status line's input is kept as the last (`last_live`: what the
+/// hooks and the refresh go by): only one with Claude's numbers in it. Empty
+/// or broken input (`statusline < /dev/null` run by hand would write
+/// `{}` over the live numbers) and a session's first
+/// look, before it has any, leave the last one as it is.
+pub fn worth_keeping(d: &Value) -> bool {
+    d.get("rate_limits").is_some_and(|r| r.is_object() && !r.as_object().is_some_and(Map::is_empty))
 }
 
 fn cmd_statusline(pl: &Places) -> i32 {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
     let d: Value = serde_json::from_str(&input).unwrap_or_else(|_| json!({}));
-    let _ = write_json(&pl.cache.join("last-statusline.json"), &d, true);
+    if worth_keeping(&d) {
+        let _ = write_json(&pl.cache.join("last-statusline.json"), &d, true);
+    }
     // Claude sends this after every answer, its numbers as of that answer:
     // near the mark (or refused at it), the next request goes out on another account.
     if let (Some(c), Some(o)) = live(pl) {
@@ -1609,7 +1896,8 @@ fn cmd_statusline(pl: &Places) -> i32 {
     auto_switch(pl, &d, false);
     let (cache, active) = refresh_bg(pl);
     let names: Vec<String> = accounts(pl).into_keys().collect();
-    println!("{}", statusline(&d, &cache, active.as_deref(), &names, &pl.home, now(), settings(pl).1, true));
+    let burn = burn_from_cache(&cache, now());
+    println!("{}", statusline(&d, &cache, active.as_deref(), &names, &pl.home, now(), settings(pl).1, true, burn, crate::util::utc_offset_secs()));
     0
 }
 
@@ -1632,6 +1920,7 @@ fn cmd_list(pl: &Places, fresh: bool) -> i32 {
     let names: Vec<String> = accs.keys().cloned().collect();
     let t = now();
     let (on, at) = settings(pl);
+    let off = crate::util::utc_offset_secs();
     let next = pick_next(&names, active.as_deref(), &cache, t, at);
     println!("  {:<18}{:<30}{:<8}{:>16}{:>18}  model caps", "account", "email", "plan", "5-hour", "weekly");
     for (n, a) in &accs {
@@ -1668,10 +1957,26 @@ fn cmd_list(pl: &Places, fresh: bool) -> i32 {
         };
         println!("{mark}{n:<18}{email:<30}{plan:<8}{}{}  {}{err}", cell("5h", 16), cell("wk", 18), caps.join(", "));
         if Some(n.as_str()) == active.as_deref() {
-            if let Some(eta) = projection(ent, t) {
-                println!("{:20}{}at this pace the weekly limit hits in {}{}", "", p.org(), dur(Some(eta), false), p.r());
+            match projection(ent, t, at) {
+                Some(Outlook::Hits(s)) => println!("{:20}{}at this pace it reaches its limit ({at:.0}%) in {} ({}){}", "", p.org(), dur(Some(s), false), clock(t + s, t, off), p.r()),
+                Some(Outlook::Lasts(e)) => println!("{:20}{}at this pace about {:.0}% of its week is used by its reset{}", "", p.dim(), e, p.r()),
+                None => {}
             }
         }
+    }
+    let burn = burn_from_cache(&cache, t);
+    let room = room_left(&names, &cache, t, at);
+    let left = match burn {
+        Some((per_h, hours)) => format!("{room:.0} points left at {per_h:.1} an hour (the last {hours:.0}h)"),
+        None => format!("{room:.0} points left"),
+    };
+    match pool_outlook(&names, &cache, active.as_deref(), burn, t, at) {
+        PoolOutlook::Out { at: out, back } => {
+            let back = back.map_or("when one has room again: not known".into(), |(n, b)| format!("back {} ({n}, in {})", clock(b, t, off), dur(Some(b - t), false)));
+            println!("\n{}ETA: every account out {} (in {}), {back}; {left}{}", p.org(), clock(out, t, off), dur(Some(out - t), false), p.r());
+        }
+        PoolOutlook::Lasts => println!("\nETA: the accounts last the week; {left}"),
+        PoolOutlook::Unknown => println!("\nETA: not known yet (the burn needs {:.0}h of usage history); {left}", BURN_MIN / 3600.),
     }
     println!("\n▶ active   » next (the soonest-ending week with room)   auto-switch: {}", if on { format!("on at {at:.0}%, soonest-ending week first") } else { "off".into() });
     0
@@ -2502,13 +2807,126 @@ mod tests {
     fn the_pace_says_when_the_week_runs_out() {
         let t = 1_000_000.;
         let reset = t + 3. * 86400.;
+        let hits = |o: Option<Outlook>| match o {
+            Some(Outlook::Hits(s)) => s,
+            o => panic!("{o:?}"),
+        };
+        let lasts = |o: Option<Outlook>| match o {
+            Some(Outlook::Lasts(p)) => p,
+            o => panic!("{o:?}"),
+        };
         // 10 points in the last hour: 50 left takes 5 hours, well before the reset.
         let ent = json!({"usage": {"wk": {"pct": 50.0, "reset": reset}}, "history": [[t - 3600., 40.0, reset], [t, 50.0, reset]]});
-        let eta = projection(&ent, t).unwrap();
-        assert!((eta - 5. * 3600.).abs() < 1., "{eta}");
+        assert!((hits(projection(&ent, t, 100.)) - 5. * 3600.).abs() < 1.);
+        // Its own mark (Matthew's 90%): 40 left, 4 hours.
+        assert!((hits(projection(&ent, t, 90.)) - 4. * 3600.).abs() < 1.);
+        // Slow: lasts to the reset, 72 hours at 0.1 an hour more used by then.
         let slow = json!({"usage": {"wk": {"pct": 50.0, "reset": reset}}, "history": [[t - 3600., 49.9, reset], [t, 50.0, reset]]});
-        assert_eq!(projection(&slow, t), None, "not before it resets");
-        assert_eq!(projection(&json!({"usage": {"wk": {"pct": 100.0, "reset": reset}}}), t), Some(0.));
+        assert!((lasts(projection(&slow, t, 100.)) - 57.2).abs() < 0.01);
+        // At its mark: there now.
+        assert_eq!(projection(&json!({"usage": {"wk": {"pct": 100.0, "reset": reset}}}), t, 100.), Some(Outlook::Hits(0.)));
+        assert_eq!(projection(&json!({"usage": {"wk": {"pct": 91.0, "reset": reset}}}), t, 90.), Some(Outlook::Hits(0.)));
+        // Nothing used lately: the week's average (50 in its first 4 days), 12.5 a day.
+        let idle = json!({"usage": {"wk": {"pct": 50.0, "reset": reset}}, "history": [[t - 3600., 50.0, reset], [t, 50.0, reset]]});
+        assert!((lasts(projection(&idle, t, 100.)) - 87.5).abs() < 0.01);
+        // Nothing to go by: no reset known, no numbers, a week not started.
+        assert_eq!(projection(&json!({"usage": {"wk": {"pct": 50.0}}}), t, 100.), None);
+        assert_eq!(projection(&json!({}), t, 100.), None);
+        assert_eq!(projection(&json!({"usage": {"wk": {"pct": 0.0, "reset": t - 60.}}}), t, 100.), None);
+    }
+
+    #[test]
+    fn the_pool_runs_out_when_every_account_is_used_up_resets_played_forward() {
+        let t = 1_000_000.;
+        let (h, d) = (3600., 86400.);
+        let wk = |pct: f64, reset: f64| json!({"usage": {"wk": {"pct": pct, "reset": reset}}, "fetched": t - 60.});
+        let cache: Map<String, Value> = serde_json::from_value(json!({"a": wk(40., t + 5.6 * h), "b": wk(31., t + 5. * d + 22. * h), "c": wk(100., t + 3. * d)})).unwrap();
+        let names: Vec<String> = cache.keys().cloned().collect();
+        let out = |o: PoolOutlook| match o {
+            PoolOutlook::Out { at, back } => (at, back),
+            o => panic!("{o:?}"),
+        };
+        // 2.4 an hour: a until its week resets, then all of its new one (b's ends days later,
+        // nothing of it lost by waiting), b's 69, c's new week once it resets; then nothing until b's reset.
+        let (at, back) = out(pool_outlook(&names, &cache, Some("a"), Some((2.4, 24.)), t, AUTO_AT));
+        let want = t + (5.6 + (100. + 69. + 100.) / 2.4) * h;
+        assert!((at - want).abs() < 60., "{} h", (at - t) / h);
+        assert_eq!(back, Some(("b".to_string(), t + 5. * d + 22. * h)));
+        // Slowly, it lasts; no burn known; none burned.
+        assert_eq!(pool_outlook(&names, &cache, Some("a"), Some((0.3, 24.)), t, AUTO_AT), PoolOutlook::Lasts);
+        assert_eq!(pool_outlook(&names, &cache, Some("a"), None, t, AUTO_AT), PoolOutlook::Unknown);
+        assert_eq!(pool_outlook(&names, &cache, Some("a"), Some((0., 24.)), t, AUTO_AT), PoolOutlook::Lasts);
+        // A lower mark: each is used to it, and b's 64 run out minutes before c's week resets.
+        let (at95, back95) = out(pool_outlook(&names, &cache, Some("a"), Some((2.4, 24.)), t, 95.));
+        assert!((at95 - (t + (5.6 + (95. + 64.) / 2.4) * h)).abs() < 60., "{} h", (at95 - t) / h);
+        assert_eq!(back95, Some(("c".to_string(), t + 3. * d)));
+        // A sign-in gone is never used.
+        let mut gone = cache.clone();
+        gone.insert("b".into(), json!({"usage": {"wk": {"pct": 31.0, "reset": t + 5. * d}}, "error": "sign-in expired: /login with it again"}));
+        gone.insert("c".into(), wk(100., t + 6. * d));
+        let (at2, back2) = out(pool_outlook(&names, &gone, Some("a"), Some((2.4, 24.)), t, AUTO_AT));
+        assert!((at2 - (t + (5.6 + 100. / 2.4) * h)).abs() < 60., "{} h", (at2 - t) / h);
+        assert_eq!(back2, Some(("c".to_string(), t + 6. * d)));
+        let line = statusline(&json!({}), &gone, Some("a"), &names, Path::new("/h"), t, AUTO_AT, false, Some((2.4, 24.)), 0);
+        assert!(line.lines().nth(1).unwrap().starts_with("ETA ▼ all out "), "{line}");
+    }
+
+    #[test]
+    fn the_burn_is_had_from_the_pace_histories_until_the_refresh_keeps_one() {
+        let (t, h) = (1_000_000., 3600.);
+        // a: 10 points in its last 4 hours; b: 5 then its week reset and 2 of the new one; c: nothing.
+        let cache: Map<String, Value> = serde_json::from_value(json!({
+            "a": {"history": [[t - 4. * h, 30.0, t + 9e5], [t - 2. * h, 35.0, t + 9e5], [t, 40.0, t + 9e5]]},
+            "b": {"history": [[t - 3. * h, 95.0, t - h], [t - 2. * h, 100.0, t - h], [t, 2.0, t + 6e5]]},
+            "c": {"history": [[t - 3. * h, 50.0, t + 1e5], [t, 50.0, t + 1e5]]},
+            // older than a day: not counted
+            "d": {"history": [[t - 30. * h, 0.0, t + 1e5], [t - 26. * h, 40.0, t + 1e5]]}
+        }))
+        .unwrap();
+        let (per_h, hours) = burn_from_cache(&cache, t).unwrap();
+        assert_eq!(hours, 4.);
+        assert!((per_h - 17. / 4.).abs() < 1e-9, "{per_h}");
+        // Under two hours of it: none.
+        let short: Map<String, Value> = serde_json::from_value(json!({"a": {"history": [[t - h, 30.0, t + 9e5], [t, 40.0, t + 9e5]]}})).unwrap();
+        assert_eq!(burn_from_cache(&short, t), None);
+        assert_eq!(burn_from_cache(&Map::new(), t), None);
+    }
+
+    #[test]
+    fn the_session_line_says_the_context_the_prompt_cache_and_fast_mode() {
+        let t = 1_000_000.;
+        let d = json!({"model": {"display_name": "Opus 5.5"}, "effort": {"level": "xhigh"}, "fast_mode": true,
+                       "context_window": {"used_percentage": 6, "context_window_size": 1_000_000, "current_usage": {"input_tokens": 2, "output_tokens": 4, "cache_creation_input_tokens": 183, "cache_read_input_tokens": 57081}},
+                       "prompt_cache": {"warm": true, "ttl": "1h", "expires_at": t + 52. * 60.},
+                       "workspace": {"current_dir": "/home/k/src"}, "cost": {"total_duration_ms": 720_000, "total_cost_usd": 0.58}});
+        let line = |d: &Value| statusline(d, &Map::new(), None, &[], Path::new("/home/k"), t, AUTO_AT, false, None, 0).lines().last().unwrap().to_string();
+        assert_eq!(line(&d), "Opus 5.5 xhigh ⚡fast | ctx 6% 57k/1M · cache 52m | ~/src | 12m $0.58");
+        // The cache gone (its time up, or Claude says it's cold): the next request writes it all again.
+        let mut cold = d.clone();
+        cold["prompt_cache"]["expires_at"] = json!(t - 1.);
+        assert!(line(&cold).contains("| ctx 6% 57k/1M · cache cold |"), "{}", line(&cold));
+        cold["prompt_cache"] = json!({"warm": false, "expires_at": t + 600.});
+        assert!(line(&cold).contains("· cache cold |"));
+        // A fresh session: no tokens to tell; no cache said, none shown; fast mode off.
+        let fresh = json!({"model": {"display_name": "Opus 5.5"}, "fast_mode": false, "context_window": {"used_percentage": 0, "context_window_size": 1_000_000, "current_usage": {"input_tokens": 0}}, "workspace": {"current_dir": "/home/k"}});
+        assert_eq!(line(&fresh), "Opus 5.5 | ctx 0% | ~");
+    }
+
+    #[test]
+    fn a_clock_says_when_as_near_as_it_is() {
+        // 2026-11-27 01:30 EST (Friday) = 06:30 UTC.
+        let t = 1_795_761_000.;
+        let off = -5 * 3600;
+        assert_eq!(clock(t, t, off), "01:30");
+        assert_eq!(clock(t + 5.5 * 3600., t, off), "07:00");
+        assert_eq!(clock(t + 23. * 3600., t, off), "Sat 00:30");
+        assert_eq!(clock(t + 3. * 86400. - 30. * 60., t, off), "Mon 01:00");
+        assert_eq!(clock(t + 10. * 86400., t, off), "Dec 7");
+        assert_eq!(clock(t, t, 0), "06:30");
+        assert_eq!(tokens_text(57_266.), "57k");
+        assert_eq!(tokens_text(1_000_000.), "1M");
+        assert_eq!(tokens_text(1_500_000.), "1.5M");
+        assert_eq!(tokens_text(850.), "850");
     }
 
     #[test]
@@ -2522,11 +2940,12 @@ mod tests {
         let d = json!({"model": {"display_name": "Opus 5.5"}, "effort": {"level": "xhigh"}, "context_window": {"used_percentage": 12.0},
                        "workspace": {"current_dir": "/home/k/src"}, "cost": {"total_lines_added": 3, "total_lines_removed": 1, "total_cost_usd": 1.5}});
         let names = vec!["alt".to_string(), "main".to_string()];
-        let s = statusline(&d, &cache, Some("main"), &names, Path::new("/home/k"), t, AUTO_AT, false);
+        let s = statusline(&d, &cache, Some("main"), &names, Path::new("/home/k"), t, AUTO_AT, false, None, 0);
         let lines: Vec<&str> = s.lines().collect();
-        assert_eq!(lines[0], "◆ main wk 40% ⧗1d 1h | next alt | alt 10% (2D)");
-        assert_eq!(lines[1], "Opus 5.5 xhigh | ctx 12% | ~/src | +3 -1 $1.50");
-        let none = statusline(&json!({}), &Map::new(), None, &[], Path::new("/h"), t, AUTO_AT, false);
+        assert_eq!(lines[0], "◆ main wk 40%/100 ⧗1d 1h ✓ ~47% by reset | next alt | alt 10% (2D)");
+        assert_eq!(lines[1], "ETA ? the burn needs 2h of usage history · 150 pts left");
+        assert_eq!(lines[2], "Opus 5.5 xhigh | ctx 12% | ~/src | +3 -1 $1.50");
+        let none = statusline(&json!({}), &Map::new(), None, &[], Path::new("/h"), t, AUTO_AT, false, None, 0);
         assert!(none.starts_with("no Claude account signed in\n"));
     }
 
@@ -2582,7 +3001,7 @@ mod tests {
         // With room, the week that ends soonest first (f-reset's new week hasn't
         // started); then the full ones, the one that clears soonest first.
         assert_eq!(order, ["d-half-soon", "c-half", "f-reset", "b-refused", "a-full", "e-unknown"]);
-        let line = statusline(&json!({}), &cache, Some("main"), &names, Path::new("/h"), t, AUTO_AT, false);
+        let line = statusline(&json!({}), &cache, Some("main"), &names, Path::new("/h"), t, AUTO_AT, false, None, 0);
         assert!(line.lines().next().unwrap().ends_with("| next d-half-soon | d-half-soon 50% (1D) · c-half 50% (2D) · f-reset 0% (—) · b-refused 97% (7H) · a-full 100% (3D) · e-unknown ?"), "{line}");
         // A lower mark: 97% is as full as 100%, so the one that clears sooner goes first.
         let at97: Vec<&str> = others_order(&names, "main", &cache, t, 97.).into_iter().map(String::as_str).collect();
@@ -2601,17 +3020,17 @@ mod tests {
         let names = vec!["main".to_string()];
         let line = |ent: Value| {
             let cache: Map<String, Value> = serde_json::from_value(json!({"main": ent})).unwrap();
-            statusline(&d, &cache, Some("main"), &names, Path::new("/h"), t, AUTO_AT, false).lines().next().unwrap().to_string()
+            statusline(&d, &cache, Some("main"), &names, Path::new("/h"), t, AUTO_AT, false, None, 0).lines().next().unwrap().to_string()
         };
         let wk = json!({"wk": {"pct": 40.0, "reset": t + 86400.}});
         // Just missed: the last numbers, nothing else.
-        assert_eq!(line(json!({"usage": wk, "ok": t - 200., "fetched": t - 10., "missed": "HTTP 429", "retry_at": t + 110.})), "◆ main wk 40% ⧗1d 0h | next none");
+        assert_eq!(line(json!({"usage": wk, "ok": t - 200., "fetched": t - 10., "missed": "HTTP 429", "retry_at": t + 110.})), "◆ main wk 40%/100 ⧗1d 0h ✓ ~47% by reset | next none");
         // Missed for long enough that the numbers are old: says how old, quietly.
-        assert_eq!(line(json!({"usage": wk, "ok": t - 3. * 3600., "missed": "HTTP 429"})), "◆ main wk 40% ⧗1d 0h (3h 0m old) | next none");
+        assert_eq!(line(json!({"usage": wk, "ok": t - 3. * 3600., "missed": "HTTP 429"})), "◆ main wk 40%/100 ⧗1d 0h ✓ ~47% by reset (3h 0m old) | next none");
         // Nothing yet: no number, no error.
         assert_eq!(line(json!({"usage": {"error": "HTTP 429"}, "missed": "HTTP 429"})), "◆ main usage ⟳ | next none");
         // A real error still shows.
-        assert_eq!(line(json!({"usage": wk, "error": "sign-in expired: /login with it again"})), "◆ main wk 40% ⧗1d 0h !sign-in expired: /login with it again | next none");
+        assert_eq!(line(json!({"usage": wk, "error": "sign-in expired: /login with it again"})), "◆ main wk 40%/100 ⧗1d 0h ✓ ~47% by reset !sign-in expired: /login with it again | next none");
         assert_eq!(problem(&json!({"usage": {"error": "HTTP 401"}})), Problem::Error("HTTP 401"));
         // The last point before a limit isn't rounded up to a full 100.
         assert_eq!([pct_text(99.5), pct_text(99.96), pct_text(100.), pct_text(42.4)], ["99.5", "100.0", "100", "42"]);

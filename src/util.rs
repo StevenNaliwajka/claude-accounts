@@ -154,6 +154,11 @@ pub fn plain_path(p: &Path) -> PathBuf {
     }
 }
 
+/// This PC's time zone now, in seconds east of UTC.
+pub fn utc_offset_secs() -> i64 {
+    i64::from(chrono::Local::now().offset().local_minus_utc())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
